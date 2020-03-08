@@ -1,0 +1,16 @@
+[Unit]
+Description=Xferlog Daemon
+After=network-online.target
+
+[Service]
+User=root
+Group=root
+
+Type=simple
+GuessMainPID=yes
+ExecStart=/usr/sbin/xferlogd -f
+Restart=on-failure
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

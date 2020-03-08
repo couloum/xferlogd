@@ -1,0 +1,316 @@
+#!/usr/bin/perl -w
+
+# xferlogd
+#
+# Xfer log processing and automation daemon
+#
+# Version: 1.0
+# Date: 2020-03-08
+# Author: Florian Coulmier
+
+use strict;
+
+use File::Basename qw(basename);
+use Sys::Syslog qw(:DEFAULT setlogsock);
+use Getopt::Long;
+use File::Read;
+use TOML qw/from_toml/;
+#use Data::Dumper;
+use Number::Bytes::Human qw/format_bytes/;
+
+
+###############################################################################
+# GLOBAL VARIABLES
+###############################################################################
+
+my $program = 'xferlogd';
+
+my $opt_show_usage = 0;
+my $opt_foreground = 0;
+my $opt_socket = '/var/log/proftpd/xferlog.fifo';
+my $opt_xferlog = '/var/log/proftpd/xferlog';
+my $opt_conffile = '/etc/xferlogd.conf';
+my $outputs = {
+  file => {
+    enabled => 0,
+    sub => \&handler_output_file,
+    conf => [],
+  },
+  syslog => {
+    enabled => 0,
+    sub => \&handler_output_syslog,
+    conf => [],
+  },
+  pushbullet => {
+    enabled => 0,
+    sub => \&handler_output_pushbullet,
+    conf => [],
+  }
+};
+#my $syslog_facility = 'daemon';
+#my $syslog_level = 'info';
+
+###############################################################################
+# FUNCTIONS
+###############################################################################
+
+sub show_usage {
+  my $help =<<'EOT';
+xferlogd - A daemon to process FTP xferlog
+
+Usage: xferlogd [Options]
+
+Options
+-------
+  -c, --conf FILE     Path to configuration file (/etc/xferlogd.conf)
+  -f, --foreground    Execute this program in foreground
+  -h, --help          Show this menu
+EOT
+
+  print $help;
+
+}
+
+sub daemonize {
+  use POSIX;
+  POSIX::setsid or die "setsid: $!";
+  my $pid = fork() // die $!; #//
+  exit(0) if $pid;
+
+  chdir "/";
+  umask 0;
+  for (0 .. (POSIX::sysconf (&POSIX::_SC_OPEN_MAX) || 1024))
+    { POSIX::close $_ }
+  open (STDIN, "</dev/null");
+  open (STDOUT, ">/dev/null");
+  open (STDERR, ">&STDOUT");
+}
+
+sub printl {
+	my $msg = shift;
+  my $level = shift;
+  print "[$level] $msg\n" if ($opt_foreground);
+}
+
+sub read_conf {
+  my $conffile = shift;
+
+  my ($conf, $err) = from_toml(read_file($conffile));
+  unless($conf) {
+    die("Invalid configuration file: $err\n");
+  }
+
+  return $conf;
+}
+
+# Replace %* patterns in a string with corresponding data from xfer log line
+# Replacements:
+# - %u: Username
+# - %c: Client
+# - %f: File name
+# - %F: Full file path
+# - %d: Date
+# - %D: Duration
+# - %s: File size
+# - %S: File size in human readable format
+# - %b: Bandwidth in MB/s
+# - %a: Action ('download' or 'upload')
+# - %A: Action ('downloaded' or 'uploaded')
+sub substitute_data {
+  my $string = shift;
+  my $data = shift;
+
+  my $bfile = basename($data->{file});
+  my $action;
+  if ($data->{direction} eq 'i') {
+    $action = 'upload';
+  } else {
+    $action = 'download';
+  }
+  my $bandwidth = sprintf('%.2f', ($data->{size} / (1024*1024*($data->{duration}+1))));
+
+  my $human_size = Number::Bytes::Human::format_bytes($data->{size});
+
+
+  $string =~ s/%u/$data->{user}/g;
+  $string =~ s/%c/$data->{client}/g;
+  $string =~ s/%F/$data->{file}/g;
+  $string =~ s/%f/$bfile/g;
+  $string =~ s/%d/$data->{date}/g;
+  $string =~ s/%D/$data->{duration}/g;
+  $string =~ s/%s/$data->{size}/g;
+  $string =~ s/%S/$human_size/g;
+  $string =~ s/%a/$action/g;
+  $string =~ s/%A/${action}ed/g;
+  $string =~ s/%b/$bandwidth/g;
+
+  return $string;
+}
+
+###############################################################################
+# OUTPUT HANDLERS
+###############################################################################
+
+sub handler_output_file() {
+  my $conf = shift;
+  my $data = shift;
+
+  my $path = $conf->{path} // '/var/log/ftpd/xferlog';
+  open(XFER, ">>$path");
+  print XFER $data->{full_line}, "\n";
+  close(XFER);
+  printl(sprintf('Line written to file %s', $path), 'INFO');
+}
+
+sub handler_output_syslog() {
+  my $conf = shift;
+  my $data = shift;
+  setlogsock 'unix';
+
+  my $facility = $conf->{facility} // 'daemon';
+  my $level = $conf->{level} // 'info';
+
+  openlog($program, 'pid', $facility);
+  syslog($level, $data->{full_line});
+  closelog();
+}
+
+sub handler_output_pushbullet() {
+  my $conf = shift;
+  my $data = shift;
+
+  # Get conf
+  my $token = $conf->{token};
+  my $title = $conf->{title} // '%u %A file %f';
+  my $body = $conf->{body} // 'User %u (%c) %A file %F (%S) in %D seconds at %b MB/s';
+  my $alert_upload = $conf->{alert_upload} // 1;
+  my $alert_download = $conf->{alert_download} // 1;
+  my $skip_incomplete = $conf->{skip_incomplete} // 1;
+  my $filename_filter = $conf->{filename_filter} // '.';
+  my $filesize_min_mb = $conf->{filesize_min_mb} // 1;
+
+  # Check variables
+  if (!defined($conf->{token})) {
+    printl('No access token found for pushbullet. Cannot send notification', 'WARN');
+    return
+  }
+
+  # Check conditions
+  my $exit_msg;
+
+  if ($data->{direction} eq 'i' and not $alert_upload) {
+    $exit_msg = 'upload alerts disabled';
+  } elsif ($data->{direction} eq 'o' and not $alert_download) {
+    $exit_msg = 'download alerts disabled';
+  } elsif ($data->{size} < $filesize_min_mb) {
+    $exit_msg = sprintf("file too small ( %.2f < %s MB)", $data->{size}/(1024*1024), $filesize_min_mb);
+  } elsif ($data->{file} !~ /$filename_filter/) {
+    $exit_msg = sprintf("filename does not match regular expression (%s)", $conf->{filename_filter});
+  } elsif ($data->{status} eq 'i' and $skip_incomplete) {
+    $exit_msg = 'Notification for incomplete files is disabled';
+  }
+
+  if ($exit_msg) {
+    printl(sprintf("No pushbullet notification sent for file %s: %s", $data->{file}, $exit_msg), "DEBUG");
+    return;
+  }
+
+  $title = substitute_data($title, $data);
+  $body = substitute_data($body, $data);
+
+  my $cmd = sprintf('curl -s --header \'Access-Token: %s\' --header \'Content-Type: application/json\' --request POST --data-binary \'{"title": "%s", "body": "%s", "type": "note"}\' https://api.pushbullet.com/v2/pushes',
+    $conf->{token},
+    $title,
+    $body);
+  my $output = `$cmd`;
+  printl("Pushbullet notification sent: $title", "INFO");
+  printl("Output is: $output", "DEBUG");
+}
+
+###############################################################################
+# MAIN PROGRAM
+###############################################################################
+
+
+GetOptions(
+  'f|foreground' => \$opt_foreground,
+  'c|conf=s'     => \$opt_conffile,
+  'h|help'       => \$opt_show_usage,
+);
+
+if ($opt_show_usage) {
+  show_usage();
+  exit 0;
+}
+
+printl("Starting xferlog", "INFO");
+daemonize() unless($opt_foreground);
+
+printl("Reading configuration file", "DEBUG");
+my $conf = read_conf($opt_conffile);
+
+#print Dumper $conf;
+#exit(0);
+
+# Get all outputs
+foreach my $output (keys %{$conf->{outputs}}) {
+  if (defined($outputs->{$output})) {
+    my $nb = 0;
+    #print Dumper $conf->{outputs}{$output};
+    foreach my $cur_output (@{$conf->{outputs}{$output}}) {
+      printl(sprintf('Found new output handler: %s[%d]', $output, $nb), "DEBUG");
+      $outputs->{$output}{enabled} = 1;
+      push($outputs->{$output}{conf}, $cur_output);
+      $nb++;
+    }
+  }
+}
+
+while(1) {
+  open(FIFO, "< $opt_socket") or die "$program: unable to open $opt_socket: $!\n";
+
+  while(my $line = <FIFO>) {
+    chomp $line;
+    printl("Consumed line from FIFO: $line", "DEBUG");
+    # Examples of $line:
+    # Sun Jun 17 14:33:58 2018 0 hostname.domain.com 5 /srv/ftp/foo a _ o r myuser ftp 0 * c
+    # Sun Jul 15 10:31:34 2018 0 reversedns.domain.com 43168 /srv/ftp/photo.jpg b _ o r myuser ftps 0 * c
+    if ($line =~ /^([a-z]{3} [a-z]{3} \d+ [\d:]+ \d{4}) (\d+) ([^\s]+) (\d+) (.*?) ([ab]) ([CUT_]) ([oid]) ([ar]) ([^\s]+) (ftps?) ([01]) (.*) ([ci])*$/i) {
+      my $xfer = {
+        full_line   => $line,
+        date        => $1, # Sun Jun 17 14:33:58
+        duration    => $2, # 0
+        client      => $3, # hostname.domain.com
+        size        => $4, # 5
+        file        => $5, # /srv/ftp/foo
+        type        => $6, # a / b
+        flag        => $7, # _
+        direction   => $8, # i / o
+        mode        => $9, # r
+        user        => $10, # myuser
+        service     => $11, # ftp / ftps
+        auth_method => $12, # 0
+        auth_userid => $13, # *
+        status      => $14, # c / i
+      };
+
+      # Process each user output
+      foreach my $output (keys %{$outputs}) {
+        if ($outputs->{$output}{enabled} == 1) {
+          my $nb = 0;
+          foreach my $conf (@{$outputs->{$output}{conf}}) {
+            printl(sprintf('Processing line in output handler \'%s[%d]\'', $output, $nb), "DEBUG");
+            $outputs->{$output}{sub}->($conf, $xfer);
+            $nb++;
+          }
+        }
+      }
+
+    } else {
+      printl("Received an invalid line from FIFO: $line", "WARN");
+    }
+  }
+
+  close(FIFO);
+}
+exit 0;
