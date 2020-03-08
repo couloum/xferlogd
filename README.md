@@ -4,6 +4,15 @@ Xfer log processing and automation daemon
 This tool will let you send pushbullet notifications when someone download a file on your FTP.
 You can fork this project to add support for other notification systems (ie, slack, Mattermost, Pushover, ...). The code is very simple and modular, so adding a new system shouldn't be very difficult.
 
+## Prerequisites
+
+Install the following perl modules:
+- File::Basename
+- Sys::Syslog
+- File::Read
+- TOML
+- Number::Bytes::Human
+
 ## Installation
 
 1. Copy configuration `xferlogd.conf` file in `/etc/xferlogd.conf` and adjust content
